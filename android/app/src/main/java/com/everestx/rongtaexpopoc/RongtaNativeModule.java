@@ -5,6 +5,8 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.pdf.PdfRenderer;
+import android.os.ParcelFileDescriptor;
 import android.util.Base64;
 
 import com.facebook.react.bridge.Arguments;
@@ -18,6 +20,7 @@ import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 import com.rt.printerlibrary.bean.BluetoothEdrConfigBean;
 import com.rt.printerlibrary.cmd.Cmd;
+import com.rt.printerlibrary.exception.SdkException;
 import com.rt.printerlibrary.cmd.EscFactory;
 import com.rt.printerlibrary.connect.PrinterInterface;
 import com.rt.printerlibrary.factory.connect.BluetoothFactory;
@@ -27,6 +30,9 @@ import com.rt.printerlibrary.factory.printer.ThermalPrinterFactory;
 import com.rt.printerlibrary.printer.RTPrinter;
 import com.rt.printerlibrary.setting.BitmapSetting;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
@@ -132,17 +138,22 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
                         ? base64Payload.substring(base64Payload.indexOf(',') + 1)
                         : base64Payload;
 
-                byte[] imageBytes = Base64.decode(cleanBase64, Base64.DEFAULT);
-                Bitmap bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
-                if (bitmap == null) {
-                    throw new IllegalStateException("Failed to decode receipt image.");
-                }
+                byte[] payloadBytes = Base64.decode(cleanBase64, Base64.DEFAULT);
 
                 Cmd cmd = new EscFactory().create();
                 BitmapSetting bitmapSetting = new BitmapSetting();
                 bitmapSetting.setBimtapLimitWidth(384);
 
-                cmd.append(cmd.getBitmapCmd(bitmapSetting, bitmap));
+                if (isPdf(payloadBytes)) {
+                    appendPdfPagesAsBitmaps(cmd, bitmapSetting, payloadBytes);
+                } else {
+                    Bitmap bitmap = BitmapFactory.decodeByteArray(payloadBytes, 0, payloadBytes.length);
+                    if (bitmap == null) {
+                        throw new IllegalStateException("Failed to decode receipt image.");
+                    }
+                    appendBitmapEsc(cmd, bitmapSetting, bitmap);
+                }
+
                 cmd.append("\n\n".getBytes(StandardCharsets.UTF_8));
                 cmd.append(cmd.getAllCutCmd());
 
@@ -204,5 +215,79 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
         reactContext
                 .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                 .emit(name, payload);
+    }
+
+    private void appendBitmapEsc(Cmd cmd, BitmapSetting bitmapSetting, Bitmap bitmap) {
+        try {
+            cmd.append(cmd.getBitmapCmd(bitmapSetting, bitmap));
+        } catch (SdkException e) {
+            throw new IllegalStateException("Rongta bitmap command failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * HTML from Expo Print is rendered to PDF. Each PDF page is rasterized and appended so
+     * multi-page receipts print in full without merging into one huge bitmap.
+     */
+    private void appendPdfPagesAsBitmaps(Cmd cmd, BitmapSetting bitmapSetting, byte[] pdfBytes)
+            throws IOException {
+        File temp = File.createTempFile("rongta_receipt", ".pdf", reactContext.getCacheDir());
+        try {
+            try (FileOutputStream fos = new FileOutputStream(temp)) {
+                fos.write(pdfBytes);
+            }
+            try (ParcelFileDescriptor pfd =
+                            ParcelFileDescriptor.open(temp, ParcelFileDescriptor.MODE_READ_ONLY);
+                    PdfRenderer renderer = new PdfRenderer(pfd)) {
+                int pageCount = renderer.getPageCount();
+                if (pageCount < 1) {
+                    throw new IllegalStateException("Receipt PDF has no pages.");
+                }
+                for (int i = 0; i < pageCount; i++) {
+                    try (PdfRenderer.Page page = renderer.openPage(i)) {
+                        Bitmap bmp = renderPdfPageToBitmap(page);
+                        try {
+                            appendBitmapEsc(cmd, bitmapSetting, bmp);
+                            if (i < pageCount - 1) {
+                                cmd.append("\n".getBytes(StandardCharsets.UTF_8));
+                            }
+                        } finally {
+                            bmp.recycle();
+                        }
+                    }
+                }
+            }
+        } finally {
+            //noinspection ResultOfMethodCallIgnored
+            temp.delete();
+        }
+    }
+
+    private Bitmap renderPdfPageToBitmap(PdfRenderer.Page page) {
+        int pageW = page.getWidth();
+        int pageH = page.getHeight();
+        final int targetW = 768;
+        int targetH = Math.max(1, Math.round(pageH * (targetW / (float) pageW)));
+        final int maxH = 8192;
+        if (targetH > maxH) {
+            float scale = maxH / (float) targetH;
+            int scaledW = Math.max(1, Math.round(targetW * scale));
+            int scaledH = maxH;
+            Bitmap bmp = Bitmap.createBitmap(scaledW, scaledH, Bitmap.Config.ARGB_8888);
+            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT);
+            return bmp;
+        }
+        Bitmap bmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888);
+        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT);
+        return bmp;
+    }
+
+    private static boolean isPdf(byte[] bytes) {
+        return bytes != null
+                && bytes.length >= 5
+                && bytes[0] == '%'
+                && bytes[1] == 'P'
+                && bytes[2] == 'D'
+                && bytes[3] == 'F';
     }
 }
