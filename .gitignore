@@ -38,4 +38,12 @@ yarn-error.*
 
 # generated native folders
 /ios
-/android
+
+# Android native project is committed for custom SDK integration
+# Ignore only generated/build outputs and local machine config.
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/**/build/
+*.keystore
