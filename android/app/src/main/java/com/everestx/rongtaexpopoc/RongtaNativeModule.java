@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothDevice;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.pdf.PdfRenderer;
+import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 import android.util.Base64;
 
@@ -27,16 +28,27 @@ import com.rt.printerlibrary.factory.connect.BluetoothFactory;
 import com.rt.printerlibrary.factory.connect.PIFactory;
 import com.rt.printerlibrary.factory.printer.PrinterFactory;
 import com.rt.printerlibrary.factory.printer.ThermalPrinterFactory;
+import com.rt.printerlibrary.enumerate.BmpPrintMode;
 import com.rt.printerlibrary.printer.RTPrinter;
 import com.rt.printerlibrary.setting.BitmapSetting;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Set;
 
 public class RongtaNativeModule extends ReactContextBaseJavaModule {
+    /** ~203 dpi printable width for 80mm roll; 58mm devices typically use 384. */
+    private static final int DEFAULT_PRINT_WIDTH_DOTS = 576;
+    private static final int MIN_PRINT_WIDTH_DOTS = 200;
+    /** Matches EscCmd.getBitmapCmd cap. */
+    private static final int MAX_PRINT_WIDTH_DOTS = 880;
+
     private final ReactApplicationContext reactContext;
     private final PrinterFactory printerFactory = new ThermalPrinterFactory();
     private final PIFactory bluetoothFactory = new BluetoothFactory();
@@ -118,7 +130,7 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
 
     @SuppressLint("MissingPermission")
     @ReactMethod
-    public void printImage(final String base64Payload, final ReadableMap printer, final Promise promise) {
+    public void printImage(final String base64OrFileUri, final ReadableMap printer, final Promise promise) {
         new Thread(() -> {
             try {
                 String address = null;
@@ -134,18 +146,15 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
 
                 connectIfNeeded(address);
 
-                String cleanBase64 = base64Payload.contains(",")
-                        ? base64Payload.substring(base64Payload.indexOf(',') + 1)
-                        : base64Payload;
-
-                byte[] payloadBytes = Base64.decode(cleanBase64, Base64.DEFAULT);
+                byte[] payloadBytes = decodePrintPayload(base64OrFileUri);
+                payloadBytes = stripLeadingNonPdfPrefix(payloadBytes);
 
                 Cmd cmd = new EscFactory().create();
-                BitmapSetting bitmapSetting = new BitmapSetting();
-                bitmapSetting.setBimtapLimitWidth(384);
+                int limitDots = resolvePrintWidthDots(printer);
+                BitmapSetting bitmapSetting = createThermalBitmapSetting(limitDots);
 
                 if (isPdf(payloadBytes)) {
-                    appendPdfPagesAsBitmaps(cmd, bitmapSetting, payloadBytes);
+                    appendPdfPagesAsBitmaps(cmd, bitmapSetting, payloadBytes, rasterTargetWidthPx(limitDots));
                 } else {
                     Bitmap bitmap = BitmapFactory.decodeByteArray(payloadBytes, 0, payloadBytes.length);
                     if (bitmap == null) {
@@ -155,6 +164,56 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
                 }
 
                 cmd.append("\n\n".getBytes(StandardCharsets.UTF_8));
+                cmd.append(cmd.getAllCutCmd());
+
+                rtPrinter.writeMsgAsync(cmd.getAppendCmds());
+
+                WritableMap payload = Arguments.createMap();
+                payload.putBoolean("success", true);
+                payload.putString("address", address);
+                emitEvent("onPrintImage", payload);
+                promise.resolve(true);
+            } catch (Exception e) {
+                WritableMap payload = Arguments.createMap();
+                payload.putBoolean("success", false);
+                payload.putString("error", e.getMessage());
+                emitEvent("onPrintImage", payload);
+                promise.reject("RONGTA_PRINT_FAILED", e);
+            }
+        }).start();
+    }
+
+    @SuppressLint("MissingPermission")
+    @ReactMethod
+    public void printText(final String textPayload, final ReadableMap printer, final Promise promise) {
+        new Thread(() -> {
+            try {
+                String address = null;
+                if (printer.hasKey("address") && !printer.isNull("address")) {
+                    address = printer.getString("address");
+                } else if (printer.hasKey("mac") && !printer.isNull("mac")) {
+                    address = printer.getString("mac");
+                }
+
+                if (address == null || address.trim().isEmpty()) {
+                    throw new IllegalArgumentException("Printer address is required.");
+                }
+                if (textPayload == null || textPayload.trim().isEmpty()) {
+                    throw new IllegalArgumentException("Text payload is empty.");
+                }
+
+                connectIfNeeded(address);
+
+                Cmd cmd = new EscFactory().create();
+                // ESC @ (initialize) + ESC t 0 (code page default)
+                cmd.append(new byte[]{0x1B, 0x40});
+                cmd.append(new byte[]{0x1B, 0x74, 0x00});
+                // ESC a 1 = center alignment
+                cmd.append(new byte[]{0x1B, 0x61, 0x01});
+                // Small initial feed so the first line doesn't get cut off.
+                cmd.append(new byte[]{0x0A, 0x0A});
+                cmd.append(textPayload.getBytes(StandardCharsets.UTF_8));
+                cmd.append("\r\n\r\n".getBytes(StandardCharsets.UTF_8));
                 cmd.append(cmd.getAllCutCmd());
 
                 rtPrinter.writeMsgAsync(cmd.getAppendCmds());
@@ -217,6 +276,118 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
                 .emit(name, payload);
     }
 
+    /**
+     * Prefer a {@code file://} URI from JS (Expo Print) so large PDFs are not truncated on the RN bridge.
+     * Falls back to raw/base64 or data-URL base64 strings.
+     */
+    private byte[] decodePrintPayload(String base64OrFileUri) throws IOException {
+        if (base64OrFileUri == null || base64OrFileUri.trim().isEmpty()) {
+            throw new IllegalArgumentException("Print payload is empty.");
+        }
+        String trimmed = base64OrFileUri.trim();
+        if (trimmed.startsWith("file:") || trimmed.startsWith("content:")) {
+            Uri uri = Uri.parse(trimmed);
+            if ("file".equals(uri.getScheme())) {
+                String path = uri.getPath();
+                if (path == null || path.isEmpty()) {
+                    throw new IllegalArgumentException("Invalid file URI for print payload.");
+                }
+                return readFileFully(new File(path));
+            }
+            try (InputStream in = reactContext.getContentResolver().openInputStream(uri)) {
+                if (in == null) {
+                    throw new IllegalArgumentException("Could not open print payload URI.");
+                }
+                return readStreamFully(in);
+            }
+        }
+        String cleanBase64 =
+                trimmed.contains(",") ? trimmed.substring(trimmed.indexOf(',') + 1) : trimmed;
+        cleanBase64 = cleanBase64.replaceAll("\\s+", "");
+        return Base64.decode(cleanBase64, Base64.DEFAULT);
+    }
+
+    private static byte[] readFileFully(File file) throws IOException {
+        try (FileInputStream in = new FileInputStream(file)) {
+            return readStreamFully(in);
+        }
+    }
+
+    private static byte[] readStreamFully(InputStream in) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] chunk = new byte[8192];
+        int n;
+        while ((n = in.read(chunk)) != -1) {
+            buffer.write(chunk, 0, n);
+        }
+        return buffer.toByteArray();
+    }
+
+    /**
+     * PDFs from some pipelines start with a UTF-8 BOM or whitespace; {@link PdfRenderer} needs a file
+     * beginning with "%PDF".
+     */
+    private static byte[] stripLeadingNonPdfPrefix(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) {
+            return bytes;
+        }
+        int idx = indexOfPdfHeader(bytes);
+        if (idx <= 0) {
+            return bytes;
+        }
+        return Arrays.copyOfRange(bytes, idx, bytes.length);
+    }
+
+    private static int indexOfPdfHeader(byte[] bytes) {
+        int i = 0;
+        if (bytes.length >= 3 && bytes[0] == (byte) 0xEF && bytes[1] == (byte) 0xBB && bytes[2] == (byte) 0xBF) {
+            i = 3;
+        }
+        while (i < bytes.length) {
+            byte b = bytes[i];
+            if (b == ' ' || b == '\r' || b == '\n' || b == '\t') {
+                i++;
+                continue;
+            }
+            if (i + 3 < bytes.length && bytes[i] == '%' && bytes[i + 1] == 'P' && bytes[i + 2] == 'D'
+                    && bytes[i + 3] == 'F') {
+                return i;
+            }
+            return -1;
+        }
+        return -1;
+    }
+
+    private static int resolvePrintWidthDots(ReadableMap printer) {
+        try {
+            if (printer != null
+                    && printer.hasKey("limitWidthDots")
+                    && !printer.isNull("limitWidthDots")) {
+                int v = printer.getInt("limitWidthDots");
+                if (v >= MIN_PRINT_WIDTH_DOTS && v <= MAX_PRINT_WIDTH_DOTS) {
+                    return v;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return DEFAULT_PRINT_WIDTH_DOTS;
+    }
+
+    /**
+     * Library default is {@link BmpPrintMode#MODE_MULTI_COLOR} which dithers lightly; thermal receipts
+     * need {@link BmpPrintMode#MODE_SINGLE_COLOR} for solid blacks.
+     */
+    private static BitmapSetting createThermalBitmapSetting(int limitDots) {
+        BitmapSetting bitmapSetting = new BitmapSetting();
+        bitmapSetting.setBmpPrintMode(BmpPrintMode.MODE_SINGLE_COLOR);
+        bitmapSetting.setBimtapLimitWidth(limitDots);
+        return bitmapSetting;
+    }
+
+    private static int rasterTargetWidthPx(int limitDots) {
+        return Math.min(MAX_PRINT_WIDTH_DOTS * 2, Math.max(limitDots * 2, 384));
+    }
+
     private void appendBitmapEsc(Cmd cmd, BitmapSetting bitmapSetting, Bitmap bitmap) {
         try {
             cmd.append(cmd.getBitmapCmd(bitmapSetting, bitmap));
@@ -229,7 +400,8 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
      * HTML from Expo Print is rendered to PDF. Each PDF page is rasterized and appended so
      * multi-page receipts print in full without merging into one huge bitmap.
      */
-    private void appendPdfPagesAsBitmaps(Cmd cmd, BitmapSetting bitmapSetting, byte[] pdfBytes)
+    private void appendPdfPagesAsBitmaps(
+            Cmd cmd, BitmapSetting bitmapSetting, byte[] pdfBytes, int pdfRasterTargetWidth)
             throws IOException {
         File temp = File.createTempFile("rongta_receipt", ".pdf", reactContext.getCacheDir());
         try {
@@ -245,7 +417,7 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
                 }
                 for (int i = 0; i < pageCount; i++) {
                     try (PdfRenderer.Page page = renderer.openPage(i)) {
-                        Bitmap bmp = renderPdfPageToBitmap(page);
+                        Bitmap bmp = renderPdfPageToBitmap(page, pdfRasterTargetWidth);
                         try {
                             appendBitmapEsc(cmd, bitmapSetting, bmp);
                             if (i < pageCount - 1) {
@@ -263,10 +435,9 @@ public class RongtaNativeModule extends ReactContextBaseJavaModule {
         }
     }
 
-    private Bitmap renderPdfPageToBitmap(PdfRenderer.Page page) {
+    private Bitmap renderPdfPageToBitmap(PdfRenderer.Page page, int targetW) {
         int pageW = page.getWidth();
         int pageH = page.getHeight();
-        final int targetW = 768;
         int targetH = Math.max(1, Math.round(pageH * (targetW / (float) pageW)));
         final int maxH = 8192;
         if (targetH > maxH) {

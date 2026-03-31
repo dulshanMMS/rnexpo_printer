@@ -2,6 +2,8 @@ import { Platform, PermissionsAndroid, NativeEventEmitter, NativeModules } from 
 import * as Print from 'expo-print';
 import * as FileSystem from 'expo-file-system';
 
+import { PIXEL_WIDTH } from '../utils/receiptRenderer';
+
 let sdkModule = null;
 
 try {
@@ -112,7 +114,24 @@ export async function htmlToBase64(html) {
     });
 }
 
-export async function printImage(base64Payload, printer) {
+/** Renders HTML to a PDF via Expo Print and sends the file URI to native code (avoids huge base64 on the JS bridge). */
+export async function printHtmlToRongta(html, printer, options = {}) {
+    const requestedWidth = Number.isFinite(printer?.limitWidthDots) ? printer.limitWidthDots : PIXEL_WIDTH;
+    const pageWidthPx = Math.max(320, Math.min(880, requestedWidth + 16));
+    const estimatedHeight = Number.isFinite(options.estimatedHeight)
+        ? options.estimatedHeight
+        : Math.max(900, Math.min(3200, 900 + (options.nodeCount || 0) * 24));
+    const printFile = await Print.printToFileAsync({
+        html,
+        width: pageWidthPx,
+        height: estimatedHeight,
+        textZoom: 100
+    });
+    await printImage(printFile.uri, printer);
+}
+
+/** @param {string} base64OrFileUri PDF or image as base64/data-URL, or a file:// / content:// URI to the PDF bytes */
+export async function printImage(base64OrFileUri, printer) {
     const module = getRongtaModule();
     if (!module || typeof module.printImage !== 'function') {
         throw new Error('Rongta print not available.');
@@ -122,7 +141,20 @@ export async function printImage(base64Payload, printer) {
         throw new Error('No printer selected.');
     }
 
-    await module.printImage(base64Payload, printer);
+    await module.printImage(base64OrFileUri, printer);
+}
+
+export async function printTextToRongta(textPayload, printer) {
+    const module = getRongtaModule();
+    if (!module || typeof module.printText !== 'function') {
+        throw new Error('Rongta text print not available.');
+    }
+    if (!printer) {
+        throw new Error('No printer selected.');
+    }
+    // Many thermal printers expect CRLF line endings.
+    const normalized = String(textPayload ?? '').replace(/\n/g, '\r\n');
+    await module.printText(normalized, printer);
 }
 
 export async function fallbackPrint(html) {

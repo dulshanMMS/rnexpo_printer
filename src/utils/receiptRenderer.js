@@ -1,5 +1,6 @@
-const PAPER_WIDTH_MM = 58;
-const PIXEL_WIDTH = 384;
+/** 80mm thermal receipt (printable ~72mm); use 576px ≈ 203dpi. */
+const PAPER_WIDTH_MM = 80;
+const PIXEL_WIDTH = 576;
 
 function escapeHtml(input) {
     if (input === null || input === undefined) {
@@ -17,7 +18,7 @@ function escapeHtml(input) {
 function renderText(node) {
     const align = node.align || 'left';
     const weight = node.bold ? '700' : '400';
-    const size = node.size || 12;
+    const size = node.size || 14;
     const spacing = node.spacingBottom || 4;
     return `<div style="text-align:${align};font-size:${size}px;font-weight:${weight};margin:0 0 ${spacing}px 0;">${escapeHtml(node.value || '')}</div>`;
 }
@@ -50,7 +51,7 @@ function renderTable(node) {
         .join('');
 
     return `
-    <table style="width:100%;border-collapse:collapse;margin:4px 0;font-size:11px;">
+    <table style="width:100%;border-collapse:collapse;margin:4px 0;font-size:13px;">
       <thead><tr>${headers}</tr></thead>
       <tbody>${rows}</tbody>
     </table>
@@ -90,7 +91,10 @@ function renderNode(node) {
     }
 }
 
-export function buildReceiptHtml(nodes) {
+export function buildReceiptHtml(nodes, options = {}) {
+    const widthPx = Number.isFinite(options.widthPx) ? options.widthPx : PIXEL_WIDTH;
+    const paperWidthMm = Number.isFinite(options.paperWidthMm) ? options.paperWidthMm : PAPER_WIDTH_MM;
+    const bodyPaddingPx = Number.isFinite(options.bodyPaddingPx) ? options.bodyPaddingPx : 8;
     const body = nodes.map((node) => renderNode(node)).join('');
 
     return `
@@ -102,8 +106,8 @@ export function buildReceiptHtml(nodes) {
         <style>
           body {
             margin: 0;
-            padding: 8px;
-            width: ${PIXEL_WIDTH}px;
+            padding: ${bodyPaddingPx}px;
+            width: ${widthPx}px;
             font-family: "Courier New", monospace;
             color: #000;
             line-height: 1.3;
@@ -115,7 +119,7 @@ export function buildReceiptHtml(nodes) {
         </style>
       </head>
       <body>
-        <div class="paper" data-paper-mm="${PAPER_WIDTH_MM}">
+        <div class="paper" data-paper-mm="${paperWidthMm}">
           ${body}
         </div>
       </body>

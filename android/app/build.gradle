@@ -61,6 +61,9 @@ react {
 
     /* Autolinking */
     autolinkLibrariesWithApp()
+
+    /* Debug APKs otherwise ship without index.android.bundle; Metro-less installs show "Unable to load script." */
+    debuggableVariants = []
 }
 
 /**

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     ActivityIndicator,
     Modal,
@@ -18,14 +18,109 @@ import {
     addRongtaListeners,
     fallbackPrint,
     findBluetoothPrinters,
-    htmlToBase64,
     isRongtaAvailable,
-    printImage,
+    printTextToRongta,
     requestBluetoothPermissions
 } from '../services/printerService';
 
 const LAST_PRINTER_KEY = 'last_printer_address';
 const VAT_RATE = 0.18;
+
+function resolvePrinterWidthDots(printer) {
+    const configured = Number(printer?.limitWidthDots);
+    if (Number.isFinite(configured) && configured >= 200 && configured <= 880) {
+        return configured;
+    }
+    const name = String(printer?.name || '').toLowerCase();
+    return name.includes('58') ? 384 : 576;
+}
+
+function padRight(value, width) {
+    const text = String(value ?? '');
+    if (text.length >= width) {
+        return text.slice(0, width);
+    }
+    return text + ' '.repeat(width - text.length);
+}
+
+function padLeft(value, width) {
+    const text = String(value ?? '');
+    if (text.length >= width) {
+        return text.slice(-width);
+    }
+    return ' '.repeat(width - text.length) + text;
+}
+
+function twoCol(left, right, width) {
+    const l = String(left ?? '');
+    const r = String(right ?? '');
+    if (l.length + r.length + 1 > width) {
+        return `${l}\n${padLeft(r, width)}`;
+    }
+    return `${l}${' '.repeat(width - l.length - r.length)}${r}`;
+}
+
+function wrapText(text, width) {
+    const source = String(text ?? '');
+    if (!source) {
+        return [''];
+    }
+    const out = [];
+    let i = 0;
+    while (i < source.length) {
+        out.push(source.slice(i, i + width));
+        i += width;
+    }
+    return out;
+}
+
+function buildReceiptPlainText(invoice, amounts, selectedBank, chequeNumber, columnsPerLine) {
+    const width = columnsPerLine; // characters-per-line for this printer mode
+    const line = '-'.repeat(width);
+    const rows = [];
+    rows.push(padRight('GasTech', width));
+    rows.push(padRight('TAX INVOICE', width));
+    rows.push(line);
+    rows.push(twoCol(`Invoice:${invoice.invoiceNo}`, `Date:${invoice.date}`, width));
+    rows.push(line);
+    rows.push(`Customer: ${invoice.customer.name}`);
+    rows.push(...wrapText(invoice.customer.address, width));
+    rows.push(`Phone: ${invoice.customer.phone}`);
+    rows.push(`TIN: ${invoice.customer.customerTin}`);
+    rows.push(line);
+    rows.push(`Supplier: ${invoice.store.name}`);
+    rows.push(...wrapText(invoice.store.address, width));
+    rows.push(`Phone: ${invoice.store.phone}`);
+    rows.push(`TIN: ${invoice.store.supplierTin}`);
+    rows.push(line);
+    rows.push('No Description       Qty   Amount');
+    invoice.items.forEach((item, idx) => {
+        const idxTxt = padRight(idx + 1, 2);
+        const name = padRight(item.name, 16);
+        const qty = padLeft(item.qty, 3);
+        const amt = padLeft(formatMoney(item.amount), 9);
+        rows.push(`${idxTxt} ${name} ${qty} ${amt}`);
+    });
+    rows.push(line);
+    rows.push(twoCol('Gross', formatMoney(invoice.gross), width));
+    rows.push(twoCol('VAT (18%)', formatMoney(invoice.vat), width));
+    rows.push(twoCol('Net Total', formatMoney(invoice.netTotal), width));
+    rows.push(line);
+    rows.push(twoCol('Cash', formatMoney(amounts.parsedCash), width));
+    rows.push(twoCol('Cheque', formatMoney(amounts.parsedCheque), width));
+    rows.push(twoCol('Credit', formatMoney(amounts.creditAmount), width));
+    if (selectedBank) {
+        rows.push(...wrapText(`Bank: ${selectedBank}`, width));
+    }
+    if (chequeNumber) {
+        rows.push(...wrapText(`Cheque No: ${chequeNumber}`, width));
+    }
+    rows.push(line);
+    rows.push('Thank you for your business');
+    rows.push('');
+    rows.push('');
+    return rows.join('\n');
+}
 
 const INVOICE_DATA = {
     store: {
@@ -127,6 +222,7 @@ export default function InvoicePrintScreen() {
     const [printResult, setPrintResult] = useState('');
     const [printError, setPrintError] = useState('');
     const [resultVisible, setResultVisible] = useState(false);
+    const printLockRef = useRef(false);
 
     const [cashEnabled, setCashEnabled] = useState(true);
     const [chequeEnabled, setChequeEnabled] = useState(false);
@@ -154,7 +250,7 @@ export default function InvoicePrintScreen() {
                             (printer) => printer?.address === lastPrinterAddress || printer?.mac === lastPrinterAddress
                         );
                         if (matched) {
-                            setSelectedPrinter(matched);
+                            setSelectedPrinter({ ...matched, limitWidthDots: resolvePrinterWidthDots(matched) });
                         }
                     }
                 },
@@ -253,7 +349,8 @@ export default function InvoicePrintScreen() {
     }, []);
 
     const handlePrinterSelect = useCallback(async (printer) => {
-        setSelectedPrinter(printer);
+        const limitWidthDots = resolvePrinterWidthDots(printer);
+        setSelectedPrinter({ ...printer, limitWidthDots });
         const address = printer?.address || printer?.mac || '';
         if (address) {
             await AsyncStorage.setItem(LAST_PRINTER_KEY, address);
@@ -312,28 +409,37 @@ export default function InvoicePrintScreen() {
     }, [invoice, amounts, selectedBank, chequeNumber]);
 
     const handlePrint = useCallback(async () => {
+        if (printLockRef.current || printing) {
+            return;
+        }
         if (!validation.isValid) {
             return;
         }
 
+        printLockRef.current = true;
         setPrinting(true);
         setPrintError('');
         setPrintResult('');
 
-        const html = buildReceiptHtml(receiptNodes);
+        const widthDots = resolvePrinterWidthDots(selectedPrinter);
+        const columns = widthDots <= 400 ? 32 : 48;
+        const receiptText = buildReceiptPlainText(invoice, amounts, selectedBank, chequeNumber, columns);
 
         try {
-            const base64Payload = await htmlToBase64(html);
-
             if (!isRongtaAvailable()) {
                 throw new Error('Rongta SDK is unavailable in this build.');
             }
 
-            await printImage(base64Payload, selectedPrinter);
+            await printTextToRongta(receiptText, { ...selectedPrinter, limitWidthDots: widthDots });
             setPrintResult('Printed via Rongta Bluetooth successfully.');
             setResultVisible(true);
         } catch (error) {
             try {
+                const widthDots = resolvePrinterWidthDots(selectedPrinter);
+                const html = buildReceiptHtml(receiptNodes, {
+                    widthPx: widthDots,
+                    paperWidthMm: widthDots <= 400 ? 58 : 80
+                });
                 await fallbackPrint(html);
                 setPrintResult('Rongta print failed. Opened system print dialog as fallback.');
                 setPrintError(error?.message || 'Rongta print failed.');
@@ -344,8 +450,20 @@ export default function InvoicePrintScreen() {
             }
         } finally {
             setPrinting(false);
+            setTimeout(() => {
+                printLockRef.current = false;
+            }, 1200);
         }
-    }, [validation.isValid, receiptNodes, selectedPrinter]);
+    }, [
+        validation.isValid,
+        invoice,
+        amounts,
+        selectedBank,
+        chequeNumber,
+        receiptNodes,
+        selectedPrinter,
+        printing
+    ]);
 
     const themed = useMemo(() => themedStyles(colors), [colors]);
 
